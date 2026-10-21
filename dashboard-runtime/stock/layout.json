@@ -1,0 +1,87 @@
+{
+  "_说明": "生图微调。只想改某几项时，删掉其他字段即可——缺失项自动用内置默认值。改完直接跑 render_screen.py，不用重启任何东西。",
+
+  "_屏幕硬件（Waveshare ESP32-S3-ePaper-3.97，非该型号才需改）": {
+    "width": "屏宽像素",
+    "height": "屏高像素",
+    "_实测": "86.40×51.84mm / 800×480 ≈ 235DPI，即 0.108mm 每像素。字号物理高度 = px × 0.108mm"
+  },
+  "width": 800,
+  "height": 480,
+
+  "_渲染质量": {
+    "render_scale": "超采样倍数。2 = 最清晰（中文笔画不发虚），1 = 更快。实测 2x 也只要约 15ms/帧，建议保持 2",
+    "threshold": "二值化阈值 0-255。调高→笔画变细（偏白），调低→笔画变粗（偏黑）。水墨屏偏淡时调到 100-110"
+  },
+  "render_scale": 2,
+  "threshold": 128,
+
+  "_布局尺寸": {
+    "header_height": "顶栏高度（含沪深300+时钟+状态块）",
+    "grid_cols": "列数",
+    "grid_rows": "行数。cols×rows 必须 ≥ watchlist.items 数量",
+    "card_pad_x": "卡片左右内边距",
+    "card_pad_y": "卡片上下内边距",
+    "divider": "分隔线宽。水墨屏最小 2，禁止 1（会断线）"
+  },
+  "header_height": 56,
+  "grid_cols": 4,
+  "grid_rows": 2,
+  "card_pad_x": 10,
+  "card_pad_y": 8,
+  "divider": 2,
+
+  "_卡片内行高": {
+    "_校验": "五项之和 + card_pad_y×2 必须等于卡片高度 (height-header_height)/grid_rows。当前 30+38+18+90+20=196，+16=212 = (480-56)/2 ✓",
+    "_改法": "想让分时图更大：从 row_name/row_price 各减几像素加给 row_chart"
+  },
+  "row_name": 30,
+  "row_price": 38,
+  "row_code": 18,
+  "row_chart": 90,
+  "row_footer": 20,
+
+  "_字号": {
+    "_物理高度对照": "14px=1.51mm(极限可读) 16px=1.73mm 20px=2.16mm 26px=2.81mm 28px=3.02mm 30px=3.24mm",
+    "_警告": "235DPI 下不要把任何字号降到 14 以下，11px 只有 1.19mm 物理高度，肉眼不可读"
+  },
+  "fs_title": 20,
+  "fs_bench_name": 16,
+  "fs_bench_price": 28,
+  "fs_badge": 16,
+  "fs_state": 16,
+  "fs_clock": 26,
+  "fs_clock_label": 14,
+  "fs_header_note": 14,
+  "fs_stock_name": 20,
+  "fs_price": 30,
+  "fs_code": 14,
+  "fs_footer": 14,
+  "fs_currency": 14,
+
+  "_分时图": {
+    "chart_line_width": "折线宽，最小 2",
+    "chart_dash": "虚线节奏 [实, 空]，用于昨收基准线和午休分界线",
+    "chart_end_dot": "末端实心圆点半径",
+    "chart_show_lunch_marker": "是否画 11:30/13:00 午休分界竖虚线"
+  },
+  "chart_line_width": 2.5,
+  "chart_dash": [4, 4],
+  "chart_end_dot": 4,
+  "chart_show_lunch_marker": true,
+
+  "_位图打包（对接固件时改这里，不用改代码）": {
+    "bit_order": "msb = 每字节高位对应左侧像素（多数驱动如 GxEPD2）；lsb = 低位在左",
+    "black_is_one": "false = 黑像素为 0（PIL 默认，白底黑字）；true = 黑像素为 1",
+    "orientation": "landscape = 800×480 横向输出；portrait = 旋转成 480×800 纵向。SSD1677 原生竖屏，若固件不做旋转则改 portrait",
+    "_排查顺序": "上屏后若出现①全黑/全白→试 black_is_one 取反 ②画面镜像或错行→试 bit_order 改成另一个 ③画面转了90度→试 orientation 改成 portrait"
+  },
+  "bit_order": "msb",
+  "black_is_one": false,
+  "orientation": "landscape",
+
+  "_输出文件名（固定不变，每轮覆盖上一张）": {},
+  "output_bin": "screen.bin",
+  "output_png": "screen.png",
+  "output_meta": "meta.json"
+}

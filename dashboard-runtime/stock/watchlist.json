@@ -1,0 +1,33 @@
+{
+  "_说明": "自选清单。改股票只需改这个文件，不用碰任何脚本。items 顺序 = 屏幕卡片位置（左上→右下），位置永久固定不重排。",
+  "_字段说明": {
+    "code": "westock 代码，必须带市场前缀。A股 sh/sz/bj，港股 hk，美股 us，指数 sh000300，板块 pt开头，期货 fu，外汇 fx",
+    "alias": "屏幕上显示的短名（可选）。不填则用数据源返回的全名。建议 4 字以内，超长会自动降字号",
+    "currency": "价格右侧的货币标注（可选），如 港元 / 美元。A股留空即可"
+  },
+  "_代码查询方法": "westock search 名称   或   westock search 名称 --type etf,index,sector,futures",
+
+  "benchmark": {
+    "code": "sh000300",
+    "alias": "沪深300",
+    "_说明": "基准指数，显示在顶栏。每张卡片的『相对』= 该股涨跌幅 − 基准涨跌幅。设为 null 可关闭基准，但卡片仍会显示各自涨跌幅"
+  },
+
+  "items": [
+    { "code": "sh518880",  "alias": "黄金ETF" },
+    { "code": "pt01801053", "alias": "贵金属" },
+    { "code": "sh513300",  "alias": "纳指ETF" },
+    { "code": "sh601318",  "alias": "中国平安" },
+    { "code": "pt01801125", "alias": "白酒" },
+    { "code": "sz300750",  "alias": "宁德时代" },
+    { "code": "sz300308",  "alias": "中际旭创" },
+    { "code": "hk01810",   "alias": "小米集团", "currency": "港元" }
+  ],
+
+  "_改标的示例": [
+    "换成茅台：把某行改成 { \"code\": \"sh600519\", \"alias\": \"贵州茅台\" }",
+    "加美股：{ \"code\": \"usAAPL\", \"alias\": \"苹果\", \"currency\": \"美元\" }（注意美股时段与A股不同，非交易时段会显示最后收盘价）",
+    "看国际金价而非ETF：{ \"code\": \"fuGC\", \"alias\": \"COMEX金\", \"currency\": \"美元\" }",
+    "格子不够：items 最多 8 项（4列×2行）。要改数量需同时改 layout.json 的 grid_cols/grid_rows"
+  ]
+}

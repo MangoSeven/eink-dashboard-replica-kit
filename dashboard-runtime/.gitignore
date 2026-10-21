@@ -1,0 +1,23 @@
+.venv/
+home/.deepseek_api_key
+home/data/
+home/out/
+stock/history.sqlite
+stock/latest.json
+stock/out/
+reading/out/
+updater.log
+
+# Preserve empty output/data directories in the repository
+!home/data/
+!home/out/
+!stock/out/
+!reading/out/
+home/data/*
+home/out/*
+stock/out/*
+reading/out/*
+!home/data/.gitkeep
+!home/out/.gitkeep
+!stock/out/.gitkeep
+!reading/out/.gitkeep

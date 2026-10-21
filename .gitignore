@@ -1,0 +1,25 @@
+# Local environments and build artifacts
+.DS_Store
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.build/
+*.log
+
+# Local credentials and personal runtime data
+.env
+.env.*
+!.env.example
+**/.deepseek_api_key
+**/auth.json
+**/home/data/*
+!**/home/data/.gitkeep
+**/home/out/*
+!**/home/out/.gitkeep
+**/stock/out/*
+!**/stock/out/.gitkeep
+**/reading/out/*
+!**/reading/out/.gitkeep
+**/stock/history.sqlite*
+**/stock/latest.json

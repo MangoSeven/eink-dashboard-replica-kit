@@ -1,0 +1,33 @@
+{
+  "_comment": "eink-home-dashboard 用户可调配置。改完即生效，无需动代码。",
+
+  "_refresh": "刷新周期（分钟），定时器与固件轮询都读这个值。默认 5。",
+  "refresh_minutes": 5,
+
+  "_art": "图像区图片路径：绝对路径，或相对技能目录的路径。换成任意 PNG/JPG 即可（自动裁成 272x272 黑白抖动）。默认海贼王。",
+  "art_image": "assets/art/default_art.png",
+
+  "_art_tune": "图像处理微调：dither=抖动(照片开/纯线稿关)，contrast=对比度增强",
+  "art_dither": true,
+  "art_contrast": 1.3,
+  "art_size": 272,
+
+  "_stale": "数据超过此分钟数视为过期，屏上显示降级态（空心/--）。传感器回传周期建议 <= 此值的一半。",
+  "stale_minutes": 90,
+
+  "_fortune": "运势兜底文案：fortune.json 缺失/未生成时显示。正常情况由模型每天生成一次写入 data/fortune.json。",
+  "fortune_fallback": "运势待生成",
+
+  "_birth": "生辰占位：模型生成运势时可参考（后续由大模型自己查/用户补充）。",
+  "birth_info": {
+    "date": "",
+    "time": "",
+    "city": "",
+    "_note": "占位。可留空，模型生成运势时自行处理。"
+  },
+
+  "_bitmap": "位图约定，与股票页/固件一致，勿改（改了固件对不上）。",
+  "bit_order": "msb",
+  "black_is_one": false,
+  "orientation": "landscape"
+}
