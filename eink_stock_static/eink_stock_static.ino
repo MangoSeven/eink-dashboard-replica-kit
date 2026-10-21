@@ -6,6 +6,9 @@
  */
 
 #include <SPI.h>
+#include <esp_sleep.h>
+#include <esp_timer.h>
+#include <driver/gpio.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <HTTPClient.h>
@@ -76,6 +79,14 @@ String wifiSsid = DASHBOARD_WIFI_SSID;
 String wifiPassword = DASHBOARD_WIFI_PASSWORD;
 String dashboardHost = DASHBOARD_HOST;
 bool ntpReady = false;
+bool batterySleepMode = false;
+bool lastNetworkSuccess = false;
+bool wakeSourcesReady = false;
+uint64_t totalSleepUs = 0;
+uint64_t totalNetworkUs = 0;
+uint32_t sleepCycles = 0;
+uint32_t powerStatusCheckedAt = 0;
+uint32_t lastPowerReport = 0;
 bool ntpRequested = false;
 // Only use RTC after an NTP time has been written to it at least once.
 bool rtcTrusted = false;
@@ -96,6 +107,10 @@ WiFiUDP discoveryUdp;
 String discoveredHost;
 
 void refreshCurrentPage(bool pageChanged, bool forceFullClean = false);
+void updatePowerSource();
+void prepareNetworkBurst();
+void stopBatteryRadio();
+void sleepUntilNextWork();
 
 bool wifiConfigured() {
   // 支持无密码的开放网络。
@@ -283,26 +298,26 @@ uint8_t shtCrc(const uint8_t* bytes, size_t length) {
   return crc;
 }
 
+bool shtCommand(uint16_t command) {
+  Wire.beginTransmission(SHT_ADDR);
+  Wire.write((uint8_t)(command >> 8));
+  Wire.write((uint8_t)command);
+  return Wire.endTransmission() == 0;
+}
+
 bool readShtc3(float& temperatureC, float& humidityPct) {
-  Wire.beginTransmission(SHT_ADDR);
-  Wire.write(0x80);
-  Wire.write(0x5D);  // soft reset
-  if (Wire.endTransmission() != 0) return false;
-  delay(2);
-
-  Wire.beginTransmission(SHT_ADDR);
-  Wire.write(0x78);
-  Wire.write(0x66);  // normal-power measurement
-  if (Wire.endTransmission() != 0) return false;
+  // Sensirion's specified cycle: wake -> measure -> read -> sleep, including error exits.
+  if (!shtCommand(0x3517)) return false;
+  delayMicroseconds(300);
+  struct SleepSensorOnExit {
+    ~SleepSensorOnExit() { shtCommand(0xB098); }
+  } sleepSensor;
+  if (!shtCommand(0x7866)) return false;
   delay(15);
-
   uint8_t bytes[6];
   if (Wire.requestFrom((int)SHT_ADDR, 6) != 6) return false;
   for (uint8_t i = 0; i < 6; ++i) bytes[i] = Wire.read();
-  if (shtCrc(bytes, 2) != bytes[2] || shtCrc(bytes + 3, 2) != bytes[5]) {
-    return false;
-  }
-
+  if (shtCrc(bytes, 2) != bytes[2] || shtCrc(bytes + 3, 2) != bytes[5]) return false;
   const uint16_t rawT = (uint16_t(bytes[0]) << 8) | bytes[1];
   const uint16_t rawH = (uint16_t(bytes[3]) << 8) | bytes[4];
   temperatureC = -45.0f + 175.0f * rawT / 65535.0f;
@@ -546,7 +561,7 @@ void updateLocalHomePanel() {
   uint8_t batteryPercent = 0;
   uint16_t batteryMv = 0;
   const bool batteryOk = readBatteryTelemetry(batteryPercent, batteryMv);
-  const String statusText = String((int)WiFi.status()) + ":" + (batteryOk ? String(batteryPercent) : "unknown");
+  const String statusText = String(batterySleepMode ? (int)lastNetworkSuccess : (int)(WiFi.status() == WL_CONNECTED)) + ":" + (batteryOk ? String(batteryPercent) : "unknown");
   if (!localHomeValid || statusText != lastStatusText) {
   // Right status group: Wi-Fi, actual battery gauge, and real percentage.
   display.setPartialWindow(630, 20, 150, 42);
@@ -676,8 +691,9 @@ void refreshCurrentPage(bool pageChanged, bool forceFullClean) {
     if (currentPage == PAGE_HOME) homePartialRefreshes = 0;
   }
 
-  connectWifi();
+  prepareNetworkBurst();
   const FetchResult result = fetchCurrentPage(pageChanged);
+  if (batterySleepMode) lastNetworkSuccess = result != FETCH_FAILED;
   if (result == FETCHED) {
     // 将每页最后一次成功下载的版本存入 PSRAM，作为切页/断网兜底。
     if (pageCache[slot]) {
@@ -704,6 +720,7 @@ void refreshCurrentPage(bool pageChanged, bool forceFullClean) {
   if (currentPage == PAGE_HOME) updateLocalHomePanel();
   lastRemoteRefresh = millis();
   lastRemotePage = currentPage;
+  stopBatteryRadio();
 }
 
 uint32_t buttonPressDuration(int pin) {
@@ -733,12 +750,20 @@ void handleButtons() {
 void setup() {
   Serial.begin(115200);
   delay(200);
+  Serial.println("[BUILD] 2026-10-19 battery-sleep-v1");
 
   pinMode(BTN_UP, INPUT_PULLUP);
   pinMode(BTN_FUNCTION, INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
   Wire.begin(SHT_SDA, SHT_SCL);
   loadStoredSettings();
+  updatePowerSource();
+  wakeSourcesReady =
+      gpio_wakeup_enable((gpio_num_t)BTN_UP, GPIO_INTR_LOW_LEVEL) == ESP_OK &&
+      gpio_wakeup_enable((gpio_num_t)BTN_FUNCTION, GPIO_INTR_LOW_LEVEL) == ESP_OK &&
+      gpio_wakeup_enable((gpio_num_t)BTN_DOWN, GPIO_INTR_LOW_LEVEL) == ESP_OK &&
+      esp_sleep_enable_gpio_wakeup() == ESP_OK;
+  Serial.printf("[POWER] button_wake=%s\n", wakeSourcesReady ? "ready" : "FAILED");
 
   SPI.begin(EPD_SCLK, -1, EPD_MOSI, EPD_CS);
   display.init(115200);
@@ -766,17 +791,114 @@ void setup() {
   lastRemoteRefresh = millis();
 }
 
-void loop() {
-  connectWifi();  // Start time sync as soon as the network joins, independent of page refresh.
-  handleButtons();
+// TG28 REG00 bit5 = USB VBUS good; bit3 = main battery present.
+// Only read status. Never alter charger voltage/current, PMIC rails or protection registers.
+void updatePowerSource() {
+  uint8_t status = 0;
+  if (!readPmicRegister(0x00, status)) {
+    batterySleepMode = false; // Do not break USB uploads when power detection is unavailable.
+    return;
+  }
+  // A running board with no valid VBUS is battery powered even if fuel-gauge
+  // battery detection has not initialised yet; do not let that suppress sleep.
+  const bool nextBatteryMode = !(status & 0x20);
+  if (nextBatteryMode != batterySleepMode) {
+    batterySleepMode = nextBatteryMode;
+    Serial.printf("[POWER] mode=%s pmic=0x%02X\n", batterySleepMode ? "BATTERY" : "USB", status);
+    if (!batterySleepMode) {
+      WiFi.setAutoReconnect(true);
+      lastWifiAttempt = 0;
+      connectWifi();
+    }
+  }
+  powerStatusCheckedAt = millis();
+}
+
+void prepareNetworkBurst() {
+  const int64_t started = esp_timer_get_time();
+  if (batterySleepMode) {
+    // No background reconnects while asleep; every burst has a finite association timeout.
+    WiFi.setAutoReconnect(false);
+    lastWifiAttempt = 0;
+    connectWifi();
+    while (WiFi.status() != WL_CONNECTED &&
+           esp_timer_get_time() - started < 12000000LL) delay(25);
+    connectWifi(); // Request NTP once associated, without blocking for an NTP answer.
+  } else {
+    connectWifi();
+  }
+  totalNetworkUs += esp_timer_get_time() - started;
+}
+
+void stopBatteryRadio() {
+  if (!batterySleepMode) return;
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(true, false); // Erase neither NVS settings nor the saved WiFi password.
+  WiFi.mode(WIFI_OFF);
+  lastWifiAttempt = 0;
+}
+
+void sleepUntilNextWork() {
+  display.powerOff(); // Switch off e-paper high-voltage supply, retain partial-refresh RAM.
+  if (!batterySleepMode || !wakeSourcesReady) return;
+  // A held key must be processed, not create an immediate wake/sleep loop.
+  if (digitalRead(BTN_UP) == LOW || digitalRead(BTN_FUNCTION) == LOW ||
+      digitalRead(BTN_DOWN) == LOW) return;
+  stopBatteryRadio();
   const uint32_t now = millis();
+  const uint32_t interval = refreshIntervalFor(currentPage);
+  const uint32_t elapsedRemote = now - lastRemoteRefresh;
+  if (elapsedRemote >= interval) return;
+  uint32_t waitMs = min((uint32_t)60000, interval - elapsedRemote);
+  if (currentPage == PAGE_HOME) {
+    const uint32_t elapsedLocal = now - lastLocalRefresh;
+    if (elapsedLocal >= LOCAL_REFRESH_MS) return;
+    waitMs = min(waitMs, LOCAL_REFRESH_MS - elapsedLocal);
+  }
+  if (waitMs < 20) return;
+  if (esp_sleep_enable_timer_wakeup((uint64_t)waitMs * 1000ULL) != ESP_OK) return;
+  Serial.flush();
+  const int64_t started = esp_timer_get_time();
+  const esp_err_t result = esp_light_sleep_start();
+  if (result == ESP_OK) {
+    totalSleepUs += esp_timer_get_time() - started;
+    ++sleepCycles;
+  } else {
+    Serial.printf("[POWER] sleep_error=%d\n", (int)result);
+    delay(250); // Failure is visible in diagnostics; do not silently burn CPU in a tight loop.
+  }
+  updatePowerSource();
+}
+
+void reportPowerDiagnostics() {
+  if (millis() - lastPowerReport < 300000UL) return;
+  lastPowerReport = millis();
+  uint8_t status = 0, level = 0;
+  uint16_t mv = 0;
+  const bool statusOk = readPmicRegister(0x00, status);
+  const bool batteryOk = readBatteryTelemetry(level, mv);
+  const uint64_t uptime = esp_timer_get_time();
+  Serial.printf("[POWER] mode=%s pmic_ok=%d pmic=0x%02X battery_ok=%d soc=%u vbat_mV=%u sleep_cycles=%lu sleep_pct=%u association_ms=%llu\n",
+                batterySleepMode ? "BATTERY" : "USB", statusOk, status, batteryOk, level, mv,
+                (unsigned long)sleepCycles, uptime ? (unsigned)(100ULL * totalSleepUs / uptime) : 0,
+                (unsigned long long)(totalNetworkUs / 1000ULL));
+}
+
+void loop() {
+  if (millis() - powerStatusCheckedAt >= 1000UL) updatePowerSource();
+  if (!batterySleepMode) connectWifi();
+  handleButtons();
+  uint32_t now = millis();
   if (currentPage == PAGE_HOME && now - lastLocalRefresh >= LOCAL_REFRESH_MS) {
     updateLocalHomePanel();
-    lastLocalRefresh = now;
+    lastLocalRefresh = millis(); // Count from completion, so a long refresh cannot double-trigger.
   }
+  now = millis();
   if (lastRemotePage != currentPage || now - lastRemoteRefresh >= refreshIntervalFor(currentPage)) {
-    // 主页的远程检查周期同时承担整屏清洁刷新，避免分钟级局刷产生横纹残影。
     refreshCurrentPage(false, true);
+    if (currentPage == PAGE_HOME) lastLocalRefresh = millis();
   }
-  delay(50);
+  reportPowerDiagnostics();
+  sleepUntilNextWork();
+  if (!batterySleepMode) delay(50);
 }

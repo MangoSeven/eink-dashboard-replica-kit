@@ -1,9 +1,59 @@
-# ESP32-S3 ePaper Dashboard Replica Kit
+# ESP32-S3 墨水屏三页看板复刻包
 
-把整个文件夹交给 Codex、WorkBuddy、OpenClaw 或其他具备文件/终端能力的 AI agent，并让它先阅读 [AI_AGENT_README.md](AI_AGENT_README.md)。
+适用于 **Waveshare ESP32-S3-ePaper-3.97**：主页（时间、温湿度、Codex 用量、DeepSeek 余额）、股票看板、每日读书推荐。显示方向按原项目旋转 180°。
 
-该包不包含任何 API Key、Wi‑Fi 密码、Codex 登录信息、账户余额、日志、历史行情或 Python 虚拟环境。它能从零安装依赖、构建并上传固件，启动局域网服务，复刻三页看板。
+## 交给 AI 开始复刻
+
+将整个文件夹交给 Codex、WorkBuddy、OpenClaw 或其他能读写文件和运行程序的 AI agent，复制这句话：
+
+> 请先完整阅读 AI_AGENT_README.md，帮我安装并复刻这套看板。能自行完成的下载、配置、编译和检查请直接执行；需要我的权限或操作实体设备时给出明确步骤。接口失效请自行查证替代方案并验证，不使用模拟数据冒充真实数据。
+
+详细操作见 [AI_AGENT_README.md](AI_AGENT_README.md)，首次对话提示见 [START_PROMPT.md](START_PROMPT.md)。固件入口是 [eink_stock_static.ino](eink_stock_static/eink_stock_static.ino)，用 Arduino IDE 打开它时保留同目录全部头文件。
+
+## 安装、上传和运行
+
+在本文件夹打开终端，由 AI 优先执行：
+
+```bash
+python3 setup/agent_bootstrap.py --check
+python3 setup/agent_bootstrap.py --install --compile
+python3 setup/agent_bootstrap.py --upload --port <检测到的串口>
+./run-epaper-agent.sh
+```
+
+环境要求：Python 3、Arduino CLI 或 Arduino IDE 2；ESP32 Core 2.0.17、GxEPD2。AI 应优先自行安装依赖；缺少系统权限时再请求授权。上传前将板子通过支持数据传输的 USB 线连接电脑。
+
+上传后长按中间键约 3 秒进入配网，手机连接屏幕显示的热点，访问 `http://192.168.4.1`，选择 2.4GHz Wi-Fi 并保存。板子与电脑在同一局域网，程序通过 UDP 18999 自动发现电脑端 HTTP 1234 服务；发现失败时可在配网网页填写电脑的局域网服务地址。不要配置公网访问。
+
+保持 `./run-epaper-agent.sh` 所在终端运行。它负责安装 Python 依赖、生成位图和启动自动更新服务；电脑休眠或该程序退出后，联网数据不会继续更新，屏幕可能保留旧内容。如果端口被占用，先检查是否已有本项目服务运行，避免重复启动。
+
+## 刷新与按键
+
+| 内容 | 周期与行为 |
+| --- | --- |
+| 主页基础数据 | 电脑端每 5 分钟生成，板端每 5 分钟检查当前主页 |
+| 主页时间、温湿度和状态 | 板端每分钟检查，变化时局部绘制；时间依赖成功校时 |
+| 股票 | 每 1 分钟采集，板端在股票页每 1 分钟检查；无新行情时可保留最近有效数据 |
+| 读书推荐 | 每天更新；板端在读书页每 24 小时检查，切页或中键可请求当前内容 |
+
+上键上一页，下键下一页，中键短按刷新当前页，中键长按进入/退出配网。切页先显示缓存，再尝试联网；无有效网络时保留可用画面。PWR 保持硬件电源用途。
+
+## 本次同步：2026-10-21
+
+已更新到最后一版电池休眠优化，串口版本标识为 **`[BUILD] 2026-10-19 battery-sleep-v1`**。
+
+- USB 供电保持正常联网；电池模式按需联网，空闲停止无线并进入 Light-sleep，按键和定时器唤醒。
+- 关联超时最多 12 秒，失败保留原画面；单次休眠最多 60 秒，兼顾分钟时钟和 USB 检测。
+- 屏幕绘制后关闭高压驱动，传感器采样后休眠；保留当前刷新周期与残影清洁策略。
+
+实现、诊断和验收边界详见 [电池低功耗方案与验证.md](电池低功耗方案与验证.md)。固件编译与主机模拟不能替代板上电流和续航测试；尚未验证达到 10–15 天续航，电量百分比也尚未完成完整充放电校验。
+
+## 数据与隐私
+
+股票使用真实公开行情，接口异常时由接手 AI 验证替代数据源。Codex 用量依赖复刻者本机登录态；DeepSeek 余额为可选功能，用户将自己的 Key 保存到本机 `dashboard-runtime/home/.deepseek_api_key`，不要粘贴到聊天、提交 Git 或公开分发。
+
+包内不附带原作者的 API Key、Wi-Fi 密码、登录信息、账户余额、历史行情和虚拟环境。离线主页兜底位图保持无账户数据版本。
 
 ## 许可证
 
-本项目原创代码与文档采用 [MIT License](LICENSE)。第三方库、角色形象和图片素材的权利归各自权利人所有，不因本项目许可证获得额外授权。`dashboard-runtime/assets/art/default_art.png` 为角色示例图，不属于本项目原创素材，使用或再分发前请自行确认相应授权；可通过 `home_config.json` 替换为自己的图片。
+本项目原创代码与文档采用 [MIT License](LICENSE)。第三方库、角色形象和图片素材的权利归各自权利人所有，不因本项目许可证获得额外授权。`dashboard-runtime/assets/art/default_art.png` 为角色示例图，使用或再分发前请确认授权；可通过 `home_config.json` 替换为自己的图片。
