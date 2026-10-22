@@ -30,6 +30,10 @@ import json
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from data_status import now as china_now, source_status, load as status_load, finite_number
+
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
@@ -292,9 +296,11 @@ def draw_codex_card(dc, f, codex, now, stale_min):
     dc.rect([24, 238, 28, 314], fill=0)
     dc.text(40, 254, "Codex 用量", 19, "cjkb", ls=2)
 
-    fresh = is_fresh(codex.get("ts"), now, stale_min) and not codex.get("stale")
-    five_remaining = codex.get("five_hour_remaining") if fresh else None
-    week_remaining = codex.get("weekly_remaining") if fresh else None
+    state = source_status(codex, codex.get("_attempt"), now, max_age=600,
+                          value_ok=finite_number(codex.get("five_hour_remaining")) or finite_number(codex.get("weekly_remaining")))
+    dc.text(464, 254, state["label"], 18, "cjk", anchor="rs")
+    five_remaining = codex.get("five_hour_remaining") if finite_number(codex.get("five_hour_remaining")) and state["state"] in ("fresh", "cached") else None
+    week_remaining = codex.get("weekly_remaining") if finite_number(codex.get("weekly_remaining")) and state["state"] in ("fresh", "cached") else None
     # 进度条统一表达「已用」：剩余 100% 时为空，用量越高填充越多。
     five_used = None if five_remaining is None else 100.0 - float(five_remaining)
     week_used = None if week_remaining is None else 100.0 - float(week_remaining)
@@ -308,19 +314,20 @@ def draw_deepseek_card(dc, f, ds, now, stale_min):
     dc.rect([24, 352, 28, 416], fill=0)
     dc.text(40, 368, "DeepSeek 余额", 19, "cjkb", ls=2)
 
-    fresh = is_fresh(ds.get("ts"), now, stale_min)
     configured = bool(ds.get("configured"))
-    balance = ds.get("balance") if fresh and configured else None
+    state = source_status(ds, ds.get("_attempt"), now, max_age=600, configured=configured, value_ok=finite_number(ds.get("balance")))
+    dc.text(464, 368, state["label"], 18, "cjk", anchor="rs")
+    balance = ds.get("balance") if configured and finite_number(ds.get("balance")) and state["state"] in ("fresh", "cached") else None
     if balance is None:
         dc.text(40, 404, "未配置" if not configured else "暂不可用", 22, "cjkb")
-        dc.text(144, 403, "设置 API Key 后自动更新" if not configured else "保留上次查询结果", 18, "cjk")
+        dc.text(144, 403, "设置 API Key 后自动更新" if not configured else "尚无有效查询结果", 18, "cjk")
         return
 
     currency = str(ds.get("currency") or "CNY").upper()
     prefix = "¥" if currency == "CNY" else ("$" if currency == "USD" else currency + " ")
     dc.text(40, 403, "可用余额", 18, "cjkb")
     dc.text(146, 405, prefix + ("%.2f" % float(balance)), 27, "monob")
-    dc.text(378, 403, "可调用" if ds.get("is_available") else "余额不足", 18, "cjkb")
+    dc.text(378, 403, "" if state["state"] == "cached" else ("可调用" if ds.get("is_available") else "不可用"), 18, "cjkb")
 
 
 def draw_fortune(dc, f, fortune, cfg):
@@ -443,7 +450,10 @@ def main():
     fortune = load_json(os.path.join(data_dir, "fortune.json"))
 
     # 本地时间（可被 --clock/--date 覆盖用于调试）
-    now = datetime.now()
+    attempts = status_load(os.path.join(os.path.dirname(runtime), ".runtime", "status.json"))
+    codex = dict(codex or {}); codex["_attempt"] = attempts.get("codex", {})
+    deepseek = dict(deepseek or {}); deepseek["_attempt"] = attempts.get("deepseek", {})
+    now = china_now()
     if args.date:
         try:
             base = datetime.strptime(args.date, "%Y-%m-%d")
@@ -474,7 +484,7 @@ def main():
         big = art.resize((int(cfg["art_size"]) * scale, int(cfg["art_size"]) * scale),
                          Image.Resampling.NEAREST)
         img.paste(big, (504 * scale, 105 * scale))
-    dc.text(776, 405, "更新于 " + now.strftime("%H:%M"), 13, "cjkb", anchor="rs")
+    dc.text(776, 405, "页面生成 " + now.strftime("%H:%M"), 13, "cjkb", anchor="rs")
 
     # 2x 超采样 -> BOX 降采样 -> 阈值二值化（"1"模式 point(LUT) 陷阱：必须先转 L）
     if scale != 1:
@@ -491,7 +501,7 @@ def main():
         img.resize((W * ps, H * ps), Image.Resampling.NEAREST).save(
             os.path.join(out_dir, cfg["output_png_2x"]))
     atomic_write(os.path.join(out_dir, cfg["output_meta"]), json.dumps({
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generated_at": china_now().isoformat(timespec="seconds"),
         "page": "home",
         "width": W, "height": H,
         "orientation": cfg.get("orientation"),
@@ -500,6 +510,10 @@ def main():
         "bin_bytes": len(raw),
         "bin_file": os.path.basename(bin_path),
         "refresh_minutes": cfg.get("refresh_minutes"),
+        "source_details": {
+            "codex": source_status(codex, attempts.get("codex"), now, max_age=600, value_ok=finite_number(codex.get("five_hour_remaining")) or finite_number(codex.get("weekly_remaining"))),
+            "deepseek": source_status(deepseek, attempts.get("deepseek"), now, max_age=600, configured=bool(deepseek.get("configured")), value_ok=finite_number(deepseek.get("balance"))),
+        },
         "sources": {
             "sensor": "fresh" if is_fresh((sensor or {}).get("ts"), now, stale_min) else "stale/none",
             "codex": "fresh" if is_fresh((codex or {}).get("ts"), now, stale_min) else "stale/none",

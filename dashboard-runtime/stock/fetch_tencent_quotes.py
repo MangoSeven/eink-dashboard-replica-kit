@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """无需 westock 的腾讯行情采集器，输出 render_screen.py 所需 latest.json。"""
-import argparse, json, os, re, sys, tempfile, sqlite3
-from datetime import datetime
+import argparse, json, os, re, sys, tempfile, sqlite3, math
+from datetime import datetime, timezone, timedelta
 from urllib.request import Request, urlopen
 
 def market_session(now):
@@ -93,19 +93,19 @@ def main():
             except:return None
         price,prev=number(3),number(4)
         got[code]={'code':code,'name':f[1] or code,'price':price,'prev_close':prev,
-          'change_percent':number(32),'volume_ratio':number(49) if len(f)>49 else None}
+          'quote_at': f[30] if len(f)>30 else None, 'change_percent':number(32),'volume_ratio':number(49) if len(f)>49 else None}
     quotes={}
     for item in items:
         q=got.get(item['code'])
         if q:
             q['name']=item.get('alias') or q['name']; q['currency']=item.get('currency',''); quotes[item['code']]=q
     if bench.get('code') in got: quotes[bench['code']]=got[bench['code']]
-    now = datetime.now()
+    now = datetime.now(timezone(timedelta(hours=8)))
     market_state, trading = market_session(now)
     out={'fetched_at':now.isoformat(timespec='seconds'),'fetched_date':now.strftime('%Y-%m-%d'),
          'market_state':market_state,'trading':trading,'benchmark_code':bench.get('code'),'watchlist':watch,'quotes':quotes}
     expected = {x['code'] for x in items}
-    missing = expected - set(quotes)
+    missing = {code for code in expected if code not in quotes or not isinstance(quotes[code].get('price'), (int,float)) or not math.isfinite(quotes[code]['price']) or quotes[code]['price'] <= 0}
     # 禁止半份数据或模拟数据覆盖已生成的真实股票页。
     if missing:
         raise RuntimeError('行情不完整，未覆盖现有页面：' + ', '.join(sorted(missing)))

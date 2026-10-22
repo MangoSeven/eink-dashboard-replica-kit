@@ -37,7 +37,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -51,7 +51,7 @@ def log(msg):
 
 
 def now_ts():
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
 
 
 def atomic_write(path, obj):

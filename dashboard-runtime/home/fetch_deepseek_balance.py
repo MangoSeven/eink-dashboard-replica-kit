@@ -7,16 +7,17 @@ import argparse
 import json
 import os
 import sys
+import math
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 API_URL = "https://api.deepseek.com/user/balance"
 TIMEOUT = 15
 
 
 def now_ts():
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
 
 
 def atomic_write(path, obj):
@@ -64,12 +65,15 @@ def main():
 
     try:
         doc = fetch_balance(api_key)
-        info = (doc.get("balance_infos") or [{}])[0]
+        infos = doc.get("balance_infos") or []
+        info = next((item for item in infos if item.get("currency") == "CNY"), infos[0] if infos else {})
+        value = float(info["total_balance"])
+        if not math.isfinite(value) or value < 0:raise ValueError("Invalid balance")
         result = {
             "configured": True,
             "is_available": bool(doc.get("is_available")),
             "currency": info.get("currency", "CNY"),
-            "balance": float(info.get("total_balance", 0)),
+            "balance": value,
             "granted_balance": float(info.get("granted_balance", 0)),
             "topped_up_balance": float(info.get("topped_up_balance", 0)),
             "ts": now_ts(),
@@ -81,7 +85,7 @@ def main():
     except urllib.error.HTTPError as e:
         print("WARN DeepSeek 余额查询失败: HTTP %s；保留上次有效余额" % e.code, file=sys.stderr)
     except Exception as e:
-        print("WARN DeepSeek 余额查询失败: %s；保留上次有效余额" % e, file=sys.stderr)
+        print("WARN DeepSeek 响应无效或请求失败；保留上次有效余额", file=sys.stderr)
     return 1
 
 

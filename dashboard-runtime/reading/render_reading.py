@@ -2,7 +2,7 @@
 """每日读书推荐：按确认的 v3 版式输出 ESP32 使用的 800×480/1-bit 位图。"""
 from __future__ import annotations
 import argparse, json, os, tempfile
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from PIL import Image, ImageDraw, ImageFont
 W,H=800,480
 CJK='/System/Library/Fonts/Hiragino Sans GB.ttc'; MONO='/System/Library/Fonts/Menlo.ttc'
@@ -38,7 +38,7 @@ def pack(im):
 def main():
  ap=argparse.ArgumentParser(); ap.add_argument('--runtime',default='.'); ap.add_argument('--date'); a=ap.parse_args()
  root=os.path.abspath(a.runtime); books=json.load(open(os.path.join(root,'reading_library.json'),encoding='utf-8'))
- now=datetime.strptime(a.date,'%Y-%m-%d') if a.date else datetime.now(); book=books[now.toordinal()%len(books)]
+ now=datetime.strptime(a.date,'%Y-%m-%d') if a.date else datetime.now(timezone(timedelta(hours=8))); book=books[now.toordinal()%len(books)]
  im=Image.new('1',(W,H),1); d=ImageDraw.Draw(im)
  # v3 fixed grid: 44px outside margin, 238px quote column, 46px central gap.
  text(d,(44,34),'READING PICK',18,True,True); text(d,(756,34),'每日推荐',18,True,anchor='ra')

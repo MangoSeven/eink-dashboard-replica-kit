@@ -23,3 +23,6 @@ __pycache__/
 !**/reading/out/.gitkeep
 **/stock/history.sqlite*
 **/stock/latest.json
+
+# Local service health, battery samples and process locks
+**/.runtime/

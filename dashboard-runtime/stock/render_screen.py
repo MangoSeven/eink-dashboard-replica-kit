@@ -31,6 +31,10 @@ import os
 import sqlite3
 import sys
 from datetime import datetime, time as dtime
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from data_status import now as china_now, source_status, load as status_load, timestamp
+
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -515,16 +519,17 @@ def draw_header(d, fonts, cfg, W, payload, bench_quote, now):
     x += badge_w + 12
 
     # 右侧区块先算宽度，再决定辅助信息能留多少（绝不挤压时钟）
-    state = payload.get("market_state") or ("交易中" if payload.get("trading") else "已收盘")
-    trading = bool(payload.get("trading"))
+    state = "缓存" if payload.get("_status", {}).get("state") != "fresh" else (payload.get("market_state") or "行情")
+    trading = bool(payload.get("trading")) and state != "缓存"
     sf = fonts.get(cfg["fs_state"])
     state_w = text_w(state, sf) + 20
     state_h = 30
 
-    clock = now.strftime("%H:%M")
+    fetched = timestamp(payload.get("fetched_at"))
+    clock = fetched.strftime("%H:%M") if fetched else "--:--"
     clf = fonts.get(cfg["fs_clock"])
     lblf = fonts.get(cfg["fs_clock_label"])
-    lbl = "更新于"
+    lbl = (fetched.strftime("%m/%d") if fetched and fetched.date() != now.date() else "采集于")
     clock_w = max(text_w(clock, clf), text_w(lbl, lblf))
     clock_h = clf.size + lblf.size + 2
 
@@ -570,6 +575,7 @@ def draw_header(d, fonts, cfg, W, payload, bench_quote, now):
 
     dv = cfg["divider"] + 1
     d.rectangle([0, H - dv, W, H], fill=0)
+    return [state_x, sy, state_w, state_h]
 
 
 # ---------------------------------------------------------------- 位图打包
@@ -671,14 +677,16 @@ def main() -> int:
     d = ScaledDraw(ImageDraw.Draw(img), scale) if scale != 1 else ImageDraw.Draw(img)
     fonts = FontCache()
 
-    now = datetime.now()
+    now = china_now()
     if args.clock:
         try:
             now = now.replace(hour=int(args.clock[:2]), minute=int(args.clock[3:5]))
         except Exception:
             pass
 
-    draw_header(d, fonts, cfg, W, payload, bench_quote, now)
+    attempts = status_load(os.path.join(runtime, "..", ".runtime", "status.json"))
+    payload["_status"] = source_status(payload, attempts.get("stock"), now, max_age=180)
+    status_rect = draw_header(d, fonts, cfg, W, payload, bench_quote, now)
 
     hh = int(cfg["header_height"])
     cols, rows = int(cfg["grid_cols"]), int(cfg["grid_rows"])
@@ -733,8 +741,10 @@ def main() -> int:
         img.resize((W * ps, H * ps), Image.Resampling.NEAREST).save(
             os.path.join(out_dir, cfg.get("output_png_2x", "screen@2x.png")))
     atomic_write(meta_path, json.dumps({
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generated_at": china_now().isoformat(timespec="seconds"),
         "data_fetched_at": payload.get("fetched_at"),
+        "data_status": payload.get("_status"),
+        "status_rect": status_rect,
         "market_state": payload.get("market_state"),
         "width": W, "height": H,
         "orientation": cfg.get("orientation"),

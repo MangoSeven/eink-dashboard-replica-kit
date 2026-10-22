@@ -25,6 +25,7 @@
 #include "home_fallback_bitmap.h"
 #include "reading_fallback_bitmap.h"
 #include "weekday_glyphs.h"
+#include "status_labels.h"
 
 constexpr int EPD_BUSY = 3;
 constexpr int EPD_DC = 9;
@@ -81,6 +82,18 @@ String dashboardHost = DASHBOARD_HOST;
 bool ntpReady = false;
 bool batterySleepMode = false;
 bool lastNetworkSuccess = false;
+bool lastWifiAssociated = false;
+bool serviceEverReached = false;
+bool stockDataStale = true;
+bool stockWarningDrawn = false;
+int stockStatusRect[4] = {0,0,0,0};
+uint8_t networkFailures = 0;
+uint32_t networkRetryMs = 0;
+bool manualNetworkRequest = false;
+uint32_t retryDelayFor(uint8_t failures) {
+  if (!failures) return 0;
+  return min((uint32_t)1800000, (uint32_t)30000 << min((uint8_t)6, (uint8_t)(failures - 1)));
+}
 bool wakeSourcesReady = false;
 uint64_t totalSleepUs = 0;
 uint64_t totalNetworkUs = 0;
@@ -94,6 +107,84 @@ uint32_t lastWifiAttempt = 0;
 uint32_t lastLocalRefresh = 0;
 uint32_t lastRemoteRefresh = 0;
 Page lastRemotePage = PAGE_COUNT;
+// A page switch draws locally; association is advanced by the loop, never waited on here.
+bool networkRequestPending = false;
+bool networkBurstActive = false;
+bool networkForceDownload = false;
+bool networkForceClean = false;
+uint32_t networkRequestedAt = 0;
+uint32_t networkBurstStartedAt = 0;
+constexpr uint32_t NETWORK_DEFER_MS = 750;
+constexpr uint32_t NETWORK_ASSOCIATION_MS = 12000;
+
+struct ButtonInput {
+  int pin;
+  volatile bool down;
+  volatile uint32_t pressedAt;
+};
+struct ButtonEvent { int pin; uint32_t duration; };
+bool popButtonEvent(ButtonEvent& event); // Explicit declaration avoids Arduino prototype insertion before this type.
+ButtonInput buttonInputs[3] = {{BTN_UP, false, 0}, {BTN_FUNCTION, false, 0}, {BTN_DOWN, false, 0}};
+constexpr uint8_t BUTTON_QUEUE_SIZE = 8;
+volatile int buttonEventPins[BUTTON_QUEUE_SIZE];
+volatile uint32_t buttonEventDurations[BUTTON_QUEUE_SIZE];
+volatile uint8_t buttonQueueHead = 0, buttonQueueTail = 0;
+portMUX_TYPE buttonMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Preserve complete short presses even if they happen during wake-up or an e-paper waveform.
+void ARDUINO_ISR_ATTR buttonEdge(void* arg) {
+  ButtonInput* input = static_cast<ButtonInput*>(arg);
+  const bool low = digitalRead(input->pin) == LOW;
+  const uint32_t now = millis();
+  portENTER_CRITICAL_ISR(&buttonMux);
+  if (low && !input->down) {
+    input->down = true;
+    input->pressedAt = now;
+  } else if (!low && input->down) {
+    const uint32_t duration = now - input->pressedAt;
+    input->down = false;
+    if (duration >= 25) {
+      const uint8_t next = (buttonQueueHead + 1) % BUTTON_QUEUE_SIZE;
+      if (next != buttonQueueTail) {
+        buttonEventPins[buttonQueueHead] = input->pin;
+        buttonEventDurations[buttonQueueHead] = duration;
+        buttonQueueHead = next;
+      }
+    }
+  }
+  portEXIT_CRITICAL_ISR(&buttonMux);
+}
+
+bool buttonWorkPending() {
+  portENTER_CRITICAL(&buttonMux);
+  const bool queued = buttonQueueHead != buttonQueueTail;
+  portEXIT_CRITICAL(&buttonMux);
+  return queued || digitalRead(BTN_UP) == LOW || digitalRead(BTN_FUNCTION) == LOW || digitalRead(BTN_DOWN) == LOW;
+}
+
+bool popButtonEvent(ButtonEvent& event) {
+  portENTER_CRITICAL(&buttonMux);
+  if (buttonQueueHead == buttonQueueTail) {
+    portEXIT_CRITICAL(&buttonMux);
+    return false;
+  }
+  event.pin = buttonEventPins[buttonQueueTail];
+  event.duration = buttonEventDurations[buttonQueueTail];
+  buttonQueueTail = (buttonQueueTail + 1) % BUTTON_QUEUE_SIZE;
+  portEXIT_CRITICAL(&buttonMux);
+  return true;
+}
+
+void discardButtonEvents() {
+  portENTER_CRITICAL(&buttonMux);
+  buttonQueueTail = buttonQueueHead;
+  for (auto& input : buttonInputs) {
+    input.down = digitalRead(input.pin) == LOW;
+    input.pressedAt = millis();
+  }
+  portEXIT_CRITICAL(&buttonMux);
+}
+
 uint8_t homePartialRefreshes = 0;
 // Invalidate after every full redraw: cached values must never leave base-image blanks.
 bool localHomeValid = false;
@@ -111,6 +202,8 @@ void updatePowerSource();
 void prepareNetworkBurst();
 void stopBatteryRadio();
 void sleepUntilNextWork();
+void servicePageNetwork();
+void drawStockCacheStatus(bool cached);
 
 bool wifiConfigured() {
   // 支持无密码的开放网络。
@@ -127,6 +220,7 @@ bool discoverAgent() {
   discoveryUdp.endPacket();
   const uint32_t started = millis();
   while (millis() - started < 1500) {
+    if (buttonWorkPending()) { discoveryUdp.stop(); return false; }
     const int size = discoveryUdp.parsePacket();
     if (size) {
       char reply[80] = {0};
@@ -196,6 +290,7 @@ String setupPageHtml(const String& message = "") {
                   ".note{color:#555;line-height:1.6}.ok{padding:10px;background:#eef7ee;border-radius:8px}</style>"
                   "<body><h1>墨水屏配网</h1><p class='note'>选择 2.4GHz Wi-Fi 并输入密码。保存后板子会自动重启；电脑看板会在局域网中自动发现。</p>");
   if (message.length()) html += "<p class='ok'>" + htmlEscape(message) + "</p>";
+  html += "<p>Wi-Fi：" + String(lastWifiAssociated ? "最近连接成功" : "尚未连接/连接失败") + "；电脑服务：" + String(lastNetworkSuccess ? "最近获取成功" : "尚未获取/获取失败") + "</p>";
   html += "<form method='post' action='/save'><label>附近的 Wi-Fi</label><select name='ssid' required>" +
           nearbyNetworkOptions + "</select><label>Wi-Fi 密码</label><input name='pass' type='password' "
           "placeholder='留空则保持原密码'><label>电脑看板地址（可选兜底）</label><input name='host' "
@@ -284,6 +379,7 @@ void startConfigPortal() {
   configServer.stop();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
+  discardButtonEvents(); // Do not replay the portal exit key as another setup request.
   refreshCurrentPage(true);
 }
 
@@ -327,6 +423,7 @@ bool readShtc3(float& temperatureC, float& humidityPct) {
 
 void drawFrame(const uint8_t* bitmap, bool fullRefresh) {
   localHomeValid = false;
+  stockWarningDrawn = false;
   if (fullRefresh) {
     display.setFullWindow();
   } else {
@@ -488,12 +585,14 @@ bool readPmicRegister(uint8_t reg, uint8_t& value) {
 }
 
 bool readBatteryTelemetry(uint8_t& percent, uint16_t& millivolts) {
-  // AXP2101: 0xA4 is the fuel-gauge percentage; 0x34/0x35 expose the 14-bit VBAT ADC.
+  // AXP2101: 0xA4 is the fuel-gauge percentage; 0x34/0x35 expose the 13-bit VBAT ADC.
   uint8_t level = 0, high = 0, low = 0;
+  uint8_t presence = 0;
+  if (!readPmicRegister(0x00, presence) || !(presence & 0x08)) return false;
   if (!readPmicRegister(0xA4, level) || level > 100) return false;
   if (!readPmicRegister(0x34, high) || !readPmicRegister(0x35, low)) return false;
   percent = level;
-  millivolts = (uint16_t(high & 0x3F) << 8) | low; // AXP2101 VBAT ADC: 1mV per count.
+  millivolts = (uint16_t(high & 0x1F) << 8) | low; // AXP2101 VBAT ADC: 1mV per count.
   return millivolts >= 2500 && millivolts <= 4600;
 }
 
@@ -561,15 +660,30 @@ void updateLocalHomePanel() {
   uint8_t batteryPercent = 0;
   uint16_t batteryMv = 0;
   const bool batteryOk = readBatteryTelemetry(batteryPercent, batteryMv);
-  const String statusText = String(batterySleepMode ? (int)lastNetworkSuccess : (int)(WiFi.status() == WL_CONNECTED)) + ":" + (batteryOk ? String(batteryPercent) : "unknown");
+  uint8_t powerFlags = 0, chargeFlags = 0;
+  const bool powerOk = readPmicRegister(0x00, powerFlags);
+  const bool chargeOk = readPmicRegister(0x01, chargeFlags);
+  const bool charging = powerOk && (powerFlags & 0x08) && chargeOk && (chargeFlags >> 5) == 1;
+  const bool wifiOk = batterySleepMode ? lastWifiAssociated : WiFi.status() == WL_CONNECTED;
+  const String statusText = String((int)wifiOk) + ":" + (batteryOk ? String(batteryPercent) : "unknown") + ":" + String((int)charging) + ":" + String(powerFlags) + ":" + String((int)lastNetworkSuccess) + ":" + String((int)serviceEverReached);
   if (!localHomeValid || statusText != lastStatusText) {
   // Right status group: Wi-Fi, actual battery gauge, and real percentage.
-  display.setPartialWindow(630, 20, 150, 42);
+  display.setPartialWindow(630, 20, 150, 70);
   display.firstPage();
   do {
-    display.fillRect(630, 20, 150, 42, GxEPD_WHITE);
+    display.fillRect(630, 20, 150, 70, GxEPD_WHITE);
     drawWifiGlyph(638, 30);
+    if (!wifiOk) display.drawLine(637, 49, 663, 28, GxEPD_BLACK);
     drawBatteryGlyph(682, 31, batteryOk ? batteryPercent : -1);
+    if (charging) {
+      // Charging is determined from PMIC status, not inferred from the USB cable.
+      display.drawLine(700, 30, 691, 39, GxEPD_WHITE);
+      display.drawLine(691, 39, 701, 39, GxEPD_WHITE);
+      display.drawLine(701, 39, 693, 47, GxEPD_WHITE);
+    }
+    const uint8_t* powerLabel = !powerOk ? STATUS_BAT_UNKNOWN : !(powerFlags & 0x08) ? STATUS_BAT_ABSENT : !batteryOk ? STATUS_BAT_UNKNOWN : charging ? STATUS_BAT_CHARGING : (powerFlags & 0x20) ? STATUS_BAT_USB : STATUS_BAT_ON_BATTERY;
+    const int powerWidth = !powerOk ? STATUS_BAT_UNKNOWN_W : !(powerFlags & 0x08) ? STATUS_BAT_ABSENT_W : !batteryOk ? STATUS_BAT_UNKNOWN_W : charging ? STATUS_BAT_CHARGING_W : (powerFlags & 0x20) ? STATUS_BAT_USB_W : STATUS_BAT_ON_BATTERY_W;
+    display.drawBitmap(638, 61, powerLabel, powerWidth, 24, GxEPD_BLACK);
     char batteryLabel[8];
     if (batteryOk) snprintf(batteryLabel, sizeof(batteryLabel), "%u%%", batteryPercent);
     else snprintf(batteryLabel, sizeof(batteryLabel), "--%%");
@@ -586,6 +700,15 @@ void updateLocalHomePanel() {
       }
     }
   } while (display.nextPage());
+  // Separate service reachability from Wi-Fi association; radio sleep is not a disconnect error.
+  display.setPartialWindow(504, 436, 276, 28);
+  display.firstPage();
+  do {
+    display.fillRect(504, 436, 276, 28, GxEPD_WHITE);
+    const uint8_t* label = lastNetworkSuccess ? STATUS_SERVICE_OK : serviceEverReached ? STATUS_SERVICE_OFFLINE : STATUS_SERVICE_UNKNOWN;
+    const int width = lastNetworkSuccess ? STATUS_SERVICE_OK_W : serviceEverReached ? STATUS_SERVICE_OFFLINE_W : STATUS_SERVICE_UNKNOWN_W;
+    display.drawBitmap(504, 438, label, width, 24, GxEPD_BLACK);
+  } while (display.nextPage());
   lastStatusText = statusText;
   }
   localHomeValid = true;
@@ -601,6 +724,29 @@ uint32_t refreshIntervalFor(Page page) {
   }
 }
 
+uint32_t effectiveRefreshInterval() {
+  return max(refreshIntervalFor(currentPage), networkRetryMs);
+}
+
+void drawStockCacheStatus(bool cached) {
+  if (currentPage != PAGE_STOCK || stockStatusRect[2] <= 0 || stockWarningDrawn == cached) return;
+  const int x=stockStatusRect[0], y=stockStatusRect[1], w=stockStatusRect[2], h=stockStatusRect[3];
+  if (x<0 || y<0 || w<STATUS_CACHE_W || h<24 || x+w>800 || y+h>480) return;
+  display.setPartialWindow(x,y,w,h);
+  display.firstPage();
+  do {
+    if (cached) {
+      display.fillRect(x,y,w,h,GxEPD_WHITE);
+      display.drawRect(x,y,w,h,GxEPD_BLACK);
+      display.drawBitmap(x+(w-STATUS_CACHE_W)/2,y+(h-24)/2,STATUS_CACHE,STATUS_CACHE_W,24,GxEPD_BLACK);
+    } else if (pageCached[PAGE_STOCK] && pageCache[PAGE_STOCK]) {
+      display.fillRect(x,y,w,h,GxEPD_BLACK);
+      display.drawBitmap(0,0,pageCache[PAGE_STOCK],800,480,GxEPD_WHITE);
+    }
+  } while (display.nextPage());
+  stockWarningDrawn=cached;
+}
+
 void connectWifi() {
   // Connection and NTP setup stay in the background; button handling never blocks on Wi-Fi.
   if (!wifiConfigured()) return;
@@ -611,6 +757,7 @@ void connectWifi() {
     }
     return;
   }
+  if (networkFailures && !manualNetworkRequest && millis() - lastRemoteRefresh < networkRetryMs) return;
   if (lastWifiAttempt && millis() - lastWifiAttempt < 15000) return;
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(true); // Modem power saving; retain association and immediate button response.
@@ -640,14 +787,29 @@ FetchResult fetchCurrentPage(bool forceDownload) {
   HTTPClient http;
   const String base = dashboardHost.length() ? dashboardHost : discoveredHost;
   http.begin(base + "/api/display/page/" + String(static_cast<uint8_t>(currentPage) + 1));
-  http.setTimeout(2500);  // 局域网服务不可达时，不让按键看起来卡死。
-  const char* headers[] = {"ETag"};
-  http.collectHeaders(headers, 1);
+  http.setConnectTimeout(1000);
+  http.setTimeout(1000);  // 局域网服务不可达时，不让按键看起来卡死。
+  const char* headers[] = {"ETag", "X-Data-Stale", "X-Status-Rect"};
+  http.collectHeaders(headers, 3);
+  uint8_t soc=0, flags=0, charge=0; uint16_t mv=0;
+  if (readBatteryTelemetry(soc,mv)) {
+    http.addHeader("X-Battery-Soc",String(soc));
+    http.addHeader("X-Battery-Mv",String(mv));
+  }
+  if (readPmicRegister(0x00,flags)) http.addHeader("X-Power-Flags",String(flags));
+  if (readPmicRegister(0x01,charge)) http.addHeader("X-Charge-Flags",String(charge));
   if (!forceDownload && etags[slot].length()) {
     http.addHeader("If-None-Match", etags[slot]);
   }
 
   const int status = http.GET();
+  if (currentPage == PAGE_STOCK && (status == HTTP_CODE_OK || status == HTTP_CODE_NOT_MODIFIED)) {
+    stockDataStale = http.header("X-Data-Stale") != "0";
+    int x=0,y=0,w=0,h=0;
+    if (sscanf(http.header("X-Status-Rect").c_str(),"%d,%d,%d,%d",&x,&y,&w,&h)==4 && x>=0 && y>=0 && w>=STATUS_CACHE_W && h>=24 && x+w<=800 && y+h<=480) {
+      stockStatusRect[0]=x;stockStatusRect[1]=y;stockStatusRect[2]=w;stockStatusRect[3]=h;
+    }
+  }
   if (status == HTTP_CODE_NOT_MODIFIED) {
     http.end();
     return UNCHANGED;
@@ -661,6 +823,7 @@ FetchResult fetchCurrentPage(bool forceDownload) {
   size_t received = 0;
   const uint32_t started = millis();
   while (received < FRAME_BYTES && millis() - started < 3500) {
+    if (buttonWorkPending()) break;
     const int available = stream->available();
     if (available > 0) {
       const size_t wanted = min((size_t)available, FRAME_BYTES - received);
@@ -684,18 +847,31 @@ FetchResult fetchCurrentPage(bool forceDownload) {
 
 void refreshCurrentPage(bool pageChanged, bool forceFullClean) {
   const uint8_t slot = static_cast<uint8_t>(currentPage);
-  // 切页先显示板端缓存；网络请求在后面进行，失败也不会覆盖当前有效画面。
-  if (pageChanged && pageCached[slot] && pageCache[slot]) {
-    drawFrame(pageCache[slot], true);
+  if (pageChanged) {
+    const uint8_t* fallback = currentPage == PAGE_HOME ? home_fallback_bitmap :
+                             currentPage == PAGE_STOCK ? stock_screen_bitmap : reading_fallback_bitmap;
+    drawFrame(pageCached[slot] && pageCache[slot] ? pageCache[slot] : fallback, true);
     unchangedPageChecks[slot] = 0;
     if (currentPage == PAGE_HOME) homePartialRefreshes = 0;
   }
+  if (currentPage == PAGE_HOME) updateLocalHomePanel();
+  if (pageChanged && currentPage == PAGE_STOCK) drawStockCacheStatus(stockDataStale || !lastNetworkSuccess);
+  // A brief quiet period gives rapid navigation priority over any network operation.
+  manualNetworkRequest = pageChanged || !forceFullClean;
+  networkRequestPending = true;
+  networkForceDownload = pageChanged;
+  networkForceClean = forceFullClean;
+  networkRequestedAt = millis();
+  lastRemoteRefresh = millis();
+  lastRemotePage = currentPage;
+}
 
-  prepareNetworkBurst();
-  const FetchResult result = fetchCurrentPage(pageChanged);
-  if (batterySleepMode) lastNetworkSuccess = result != FETCH_FAILED;
+void finishNetworkRequest(FetchResult result) {
+  const uint8_t slot = static_cast<uint8_t>(currentPage);
+  lastNetworkSuccess = result != FETCH_FAILED;
+  if (lastNetworkSuccess) { serviceEverReached=true; networkFailures=0; networkRetryMs=0; }
+  else if (!buttonWorkPending()) { networkFailures=min((uint8_t)10,(uint8_t)(networkFailures+1));networkRetryMs=retryDelayFor(networkFailures); }
   if (result == FETCHED) {
-    // 将每页最后一次成功下载的版本存入 PSRAM，作为切页/断网兜底。
     if (pageCache[slot]) {
       memcpy(pageCache[slot], framebuf, FRAME_BYTES);
       pageCached[slot] = true;
@@ -704,44 +880,66 @@ void refreshCurrentPage(bool pageChanged, bool forceFullClean) {
     unchangedPageChecks[slot] = 0;
     if (currentPage == PAGE_HOME) homePartialRefreshes = 0;
   } else if (result == UNCHANGED) {
-    // A page whose source did not change still gets an occasional full-clean waveform.
     if (++unchangedPageChecks[slot] >= MAX_UNCHANGED_PAGE_CHECKS && pageCached[slot] && pageCache[slot]) {
       drawFrame(pageCache[slot], true);
       unchangedPageChecks[slot] = 0;
       if (currentPage == PAGE_HOME) homePartialRefreshes = 0;
     }
-  } else if (forceFullClean && pageCached[slot] && pageCache[slot]) {
-    // Network unavailable: scheduled cache redraw prevents ghosting without blanking the screen.
+  } else if (networkForceClean && pageCached[slot] && pageCache[slot]) {
     drawFrame(pageCache[slot], true);
     unchangedPageChecks[slot] = 0;
     if (currentPage == PAGE_HOME) homePartialRefreshes = 0;
   }
-  // 请求失败时保留已显示的缓存，不再绘制英文错误页。
-  if (currentPage == PAGE_HOME) updateLocalHomePanel();
+  if (currentPage == PAGE_STOCK) drawStockCacheStatus(!lastNetworkSuccess || stockDataStale);
+  if (currentPage == PAGE_HOME && !buttonWorkPending()) updateLocalHomePanel();
+  networkRequestPending = false;
+  manualNetworkRequest = false;
+  networkBurstActive = false;
   lastRemoteRefresh = millis();
   lastRemotePage = currentPage;
   stopBatteryRadio();
 }
 
-uint32_t buttonPressDuration(int pin) {
-  if (digitalRead(pin) != LOW) return false;
-  delay(25);
-  if (digitalRead(pin) != LOW) return 0;
-  const uint32_t started = millis();
-  while (digitalRead(pin) == LOW) delay(10);
-  return millis() - started;
+void servicePageNetwork() {
+  if (!networkRequestPending || buttonWorkPending()) return;
+  if (millis() - networkRequestedAt < NETWORK_DEFER_MS) return;
+  if (!wifiConfigured()) { finishNetworkRequest(FETCH_FAILED); return; }
+  if (!networkBurstActive) {
+    networkBurstStartedAt = millis();
+    networkBurstActive = true;
+    prepareNetworkBurst();
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    lastWifiAssociated = false;
+    if (millis() - networkBurstStartedAt < NETWORK_ASSOCIATION_MS) return;
+    totalNetworkUs += (uint64_t)(millis() - networkBurstStartedAt) * 1000ULL;
+    finishNetworkRequest(FETCH_FAILED);
+    return;
+  }
+  lastWifiAssociated = true;
+  connectWifi(); // Configure NTP once associated; do not wait for the NTP answer.
+  totalNetworkUs += (uint64_t)(millis() - networkBurstStartedAt) * 1000ULL;
+  const FetchResult result = fetchCurrentPage(networkForceDownload);
+  // A user interrupt is not a network failure. Keep prior health and reschedule for the selected page.
+  if (buttonWorkPending()) {
+    networkBurstActive = false;
+    networkRequestedAt = millis();
+    stopBatteryRadio();
+    return;
+  }
+  finishNetworkRequest(result);
 }
 
 void handleButtons() {
-  const uint32_t functionDuration = buttonPressDuration(BTN_FUNCTION);
-  if (functionDuration >= 3000) {
-    startConfigPortal();
-  } else if (functionDuration > 0) {
-    refreshCurrentPage(false);
-  } else if (buttonPressDuration(BTN_UP) > 0) {
+  ButtonEvent event;
+  if (!popButtonEvent(event)) return;
+  if (event.pin == BTN_FUNCTION) {
+    if (event.duration >= 3000) startConfigPortal();
+    else refreshCurrentPage(false);
+  } else if (event.pin == BTN_UP) {
     currentPage = static_cast<Page>((currentPage + PAGE_COUNT - 1) % PAGE_COUNT);
     refreshCurrentPage(true);
-  } else if (buttonPressDuration(BTN_DOWN) > 0) {
+  } else if (event.pin == BTN_DOWN) {
     currentPage = static_cast<Page>((currentPage + 1) % PAGE_COUNT);
     refreshCurrentPage(true);
   }
@@ -750,11 +948,16 @@ void handleButtons() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("[BUILD] 2026-10-19 battery-sleep-v1");
+  Serial.println("[BUILD] 2026-10-23 reliability-v3");
 
   pinMode(BTN_UP, INPUT_PULLUP);
   pinMode(BTN_FUNCTION, INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
+  for (auto& input : buttonInputs) {
+    input.down = digitalRead(input.pin) == LOW;
+    input.pressedAt = millis();
+    attachInterruptArg(input.pin, buttonEdge, &input, CHANGE);
+  }
   Wire.begin(SHT_SDA, SHT_SCL);
   loadStoredSettings();
   updatePowerSource();
@@ -815,19 +1018,11 @@ void updatePowerSource() {
 }
 
 void prepareNetworkBurst() {
-  const int64_t started = esp_timer_get_time();
   if (batterySleepMode) {
-    // No background reconnects while asleep; every burst has a finite association timeout.
     WiFi.setAutoReconnect(false);
     lastWifiAttempt = 0;
-    connectWifi();
-    while (WiFi.status() != WL_CONNECTED &&
-           esp_timer_get_time() - started < 12000000LL) delay(25);
-    connectWifi(); // Request NTP once associated, without blocking for an NTP answer.
-  } else {
-    connectWifi();
   }
-  totalNetworkUs += esp_timer_get_time() - started;
+  connectWifi(); // Association progresses asynchronously while loop() handles buttons.
 }
 
 void stopBatteryRadio() {
@@ -840,13 +1035,13 @@ void stopBatteryRadio() {
 
 void sleepUntilNextWork() {
   display.powerOff(); // Switch off e-paper high-voltage supply, retain partial-refresh RAM.
-  if (!batterySleepMode || !wakeSourcesReady) return;
+  if (!batterySleepMode || !wakeSourcesReady || networkRequestPending || buttonWorkPending()) return;
   // A held key must be processed, not create an immediate wake/sleep loop.
   if (digitalRead(BTN_UP) == LOW || digitalRead(BTN_FUNCTION) == LOW ||
       digitalRead(BTN_DOWN) == LOW) return;
   stopBatteryRadio();
   const uint32_t now = millis();
-  const uint32_t interval = refreshIntervalFor(currentPage);
+  const uint32_t interval = effectiveRefreshInterval();
   const uint32_t elapsedRemote = now - lastRemoteRefresh;
   if (elapsedRemote >= interval) return;
   uint32_t waitMs = min((uint32_t)60000, interval - elapsedRemote);
@@ -894,11 +1089,13 @@ void loop() {
     lastLocalRefresh = millis(); // Count from completion, so a long refresh cannot double-trigger.
   }
   now = millis();
-  if (lastRemotePage != currentPage || now - lastRemoteRefresh >= refreshIntervalFor(currentPage)) {
+  if (lastRemotePage != currentPage || now - lastRemoteRefresh >= effectiveRefreshInterval()) {
     refreshCurrentPage(false, true);
     if (currentPage == PAGE_HOME) lastLocalRefresh = millis();
   }
+  servicePageNetwork();
   reportPowerDiagnostics();
   sleepUntilNextWork();
-  if (!batterySleepMode) delay(50);
+  if (!batterySleepMode) delay(20);
+  else if (networkRequestPending || buttonWorkPending()) delay(5);
 }
